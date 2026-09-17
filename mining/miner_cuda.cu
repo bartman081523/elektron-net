@@ -725,6 +725,9 @@ __constant__ uint32_t c_K[64];
 __constant__ uint32_t c_midstate[8];
 __constant__ uint32_t c_target[8];    // MSB-first target as 8 big-endian words
 __constant__ uint32_t c_b2w[3];       // header words 64..75 (merkle tail | ntime | nbits)
+// SHA-256 IV (compile-time constant -- no host upload needed)
+__constant__ uint32_t c_IV[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                                 0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
 
 #define ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 
@@ -780,48 +783,70 @@ __device__ __forceinline__ bool target_beaten(const uint32_t f[8]) {
     return true;
 }
 
-// Scans [base_nonce, base_nonce + nonce_span) grid-stride. Checks the host
-// control word every 32 iterations so a new job aborts the current launch
-// within microseconds.
+// Scans [base_nonce, base_nonce + nonce_span) grid-stride. ILP consecutive
+// nonces are hashed per thread, the independent SHA-256 chains interleaved
+// by the scheduler (hides the serial round-dependency latency). Checks the
+// host control word every 32 iterations so a new job aborts the current
+// launch within microseconds.
+template <int ILP>
 __global__ void sha256d_scan_kernel(uint32_t base_nonce, uint32_t nonce_span,
                                     uint32_t *__restrict__ ctrl) {
     const uint32_t total = gridDim.x * blockDim.x;
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
 
     uint32_t iterations = 0;
-    for (uint32_t n = base_nonce + gid; n - base_nonce < nonce_span; n += total) {
+    for (uint32_t n = base_nonce + gid * ILP; n - base_nonce < nonce_span;
+         n += total * ILP) {
         if ((iterations & 31) == 0 && ctrl[0] != 0) break;
 
-        uint32_t s[8];
+        uint32_t s[ILP][8], w[ILP][16], d[ILP][16], f[ILP][8];
+        uint32_t live = 0;
+
+        // --- first hash: midstate + block2 (per-lane nonce) ---
 #pragma unroll
-        for (int i = 0; i < 8; ++i) s[i] = c_midstate[i];
-
-        uint32_t w[16];
-        w[0] = c_b2w[0];               // header[64..67]  (merkle tail)
-        w[1] = c_b2w[1];               // header[68..71]  (nTime)
-        w[2] = c_b2w[2];               // header[72..75]  (nBits)
-        w[3] = __byte_perm(n, 0, 0x0123); // nNonce, little-endian -> BE word (bswap32)
-        w[4] = 0x80000000;
-        w[5] = w[6] = w[7] = w[8] = w[9] = w[10] = w[11] = w[12] = w[13] = w[14] = 0;
-        w[15] = 640;                   // 80 bytes * 8 bits
-        sha256_compress(s, w);
-
-        // Second hash over the 32-byte digest: words are the digest itself.
-        uint32_t d[16];
+        for (int L = 0; L < ILP; ++L) {
+            const uint32_t nn = n + L;
+            if (nn - base_nonce < nonce_span) {
+                live |= 1u << L;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) d[i] = s[i];
-        d[8] = 0x80000000;
-        d[9] = d[10] = d[11] = d[12] = d[13] = d[14] = 0;
-        d[15] = 256;                   // 32 bytes * 8 bits
-        uint32_t f[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-                         0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
-        sha256_compress(f, d);
+                for (int i = 0; i < 8; ++i) s[L][i] = c_midstate[i];
+                w[L][0] = c_b2w[0];               // header[64..67]  (merkle tail)
+                w[L][1] = c_b2w[1];               // header[68..71]  (nTime)
+                w[L][2] = c_b2w[2];               // header[72..75]  (nBits)
+                w[L][3] = __byte_perm(nn, 0, 0x0123); // nNonce, LE -> BE (bswap32)
+                w[L][4] = 0x80000000;
+#pragma unroll
+                for (int i = 5; i < 15; ++i) w[L][i] = 0;
+                w[L][15] = 640;                   // 80 bytes * 8 bits
+            }
+        }
+#pragma unroll
+        for (int L = 0; L < ILP; ++L)
+            if (live & (1u << L)) sha256_compress(s[L], w[L]);
 
-        ++iterations;
+        // --- second hash over the 32-byte digest per lane ---
+#pragma unroll
+        for (int L = 0; L < ILP; ++L) {
+            if (live & (1u << L)) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) d[L][i] = s[L][i];
+                d[L][8] = 0x80000000;
+#pragma unroll
+                for (int i = 9; i < 15; ++i) d[L][i] = 0;
+                d[L][15] = 256;                   // 32 bytes * 8 bits
+#pragma unroll
+                for (int i = 0; i < 8; ++i) f[L][i] = c_IV[i];
+                sha256_compress(f[L], d[L]);
+            }
+        }
+        iterations += __popc(live);
 
-        if (target_beaten(f)) {
-            // First writer wins; the host re-verifies the digest before use.
-            if (atomicCAS(&ctrl[0], 0, 1) == 0) ctrl[1] = n;
+        // --- target check / report (first writer wins; host re-verifies) ---
+#pragma unroll
+        for (int L = 0; L < ILP; ++L) {
+            if (live & (1u << L) && target_beaten(f[L])) {
+                if (atomicCAS(&ctrl[0], 0, 1) == 0) ctrl[1] = n + L;
+            }
         }
     }
 
@@ -947,6 +972,7 @@ struct GpuResult {
     int sm_count = 0;
     int blocks_per_grid = 0;
     int threads_per_block = 256; // overridable via ELEK_CUDA_TPB (benchmarking)
+    int nonces_per_thread = 1;   // ILP lanes per thread, overridable via ELEK_CUDA_ILP (benchmarking)
     static constexpr uint32_t NONCE_SPAN = 1u << 24; // per launch
 
     void init(int device) {
@@ -978,6 +1004,39 @@ struct GpuResult {
         threads_per_block = tpb;
         const int blocks_per_sm = std::max(1, 1024 / tpb);
         blocks_per_grid = sm_count * blocks_per_sm;
+
+        // ILP lanes per thread: interleave N independent SHA-256 chains to
+        // hide the round-dependency latency. {1,2,4} only; 1 = one chain per
+        // thread (classic behaviour). Register pressure grows with ILP --
+        // benchmark before adopting (ptxas -v / hashrate).
+        if (const char *env = std::getenv("ELEK_CUDA_ILP"); env && *env) {
+            int ilp = std::atoi(env);
+            if (ilp != 1 && ilp != 2 && ilp != 4) {
+                std::cerr << "Warning: ELEK_CUDA_ILP=" << env
+                          << " unsupported (use 1, 2 or 4) -- using 1.\n";
+                ilp = 1;
+            }
+            nonces_per_thread = ilp;
+        }
+
+        // Guard against launch failure: high ILP multiplies register usage,
+        // so a large block may not fit on the SM at all (e.g. ILP=4 at 164
+        // regs x 512 threads > 64k regs/SM). Fall back to ILP=1 instead of
+        // crashing at the first launch.
+        if (nonces_per_thread > 1) {
+            int blocks_per_sm_resident = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_sm_resident,
+                nonces_per_thread == 2 ? (const void *)sha256d_scan_kernel<2>
+                                       : (const void *)sha256d_scan_kernel<4>,
+                threads_per_block, 0);
+            if (blocks_per_sm_resident < 1) {
+                std::cerr << "Warning: ILP=" << nonces_per_thread << " at "
+                          << threads_per_block
+                          << " threads/block exceeds SM resources -- falling back to ILP=1.\n";
+                nonces_per_thread = 1;
+            }
+        }
 
         CUDA_CHECK(cudaHostAlloc(&host_ctrl, 4 * sizeof(uint32_t), cudaHostAllocMapped));
         CUDA_CHECK(cudaHostGetDevicePointer(&dev_ctrl, host_ctrl, 0));
@@ -1034,7 +1093,11 @@ struct GpuResult {
     // (host_ctrl[1] holds it). Updates hash accounting.
     bool scan_chunk(uint32_t base, uint32_t span) {
         host_ctrl[0] = 0;
-        sha256d_scan_kernel<<<blocks_per_grid, threads_per_block>>>(base, span, dev_ctrl);
+        switch (nonces_per_thread) {
+        case 2:  sha256d_scan_kernel<2><<<blocks_per_grid, threads_per_block>>>(base, span, dev_ctrl); break;
+        case 4:  sha256d_scan_kernel<4><<<blocks_per_grid, threads_per_block>>>(base, span, dev_ctrl); break;
+        default: sha256d_scan_kernel<1><<<blocks_per_grid, threads_per_block>>>(base, span, dev_ctrl); break;
+        }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         return host_ctrl[0] == 1;
