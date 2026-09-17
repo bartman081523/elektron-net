@@ -215,6 +215,25 @@ static std::string json_quote_string(const std::string &value) {
     return oss.str();
 }
 
+// Text value of a top-level JSON key, tolerant of whitespace around ':'.
+// Returns everything from the first non-whitespace character after the colon
+// ("true", "false", "null", "[...", "\"...\""), or "" when the key is absent.
+// Unlike a raw find("\"result\":true") this also matches pretty-printed
+// responses such as {"result": true, ...}.
+static std::string json_value_after_colon(const std::string &json, const std::string &key) {
+    const std::string quoted = "\"" + key + "\"";
+    size_t pos = json.find(quoted);
+    while (pos != std::string::npos) {
+        size_t i = json.find_first_not_of(" \t\r\n", pos + quoted.size());
+        if (i != std::string::npos && json[i] == ':') {
+            i = json.find_first_not_of(" \t\r\n", i + 1);
+            return i == std::string::npos ? "" : json.substr(i);
+        }
+        pos = json.find(quoted, pos + quoted.size());
+    }
+    return "";
+}
+
 static std::string json_rpc(const std::string &method,
                             const std::vector<std::string> &params) {
     std::ostringstream oss;
@@ -250,6 +269,22 @@ static int64_t extract_json_int(const std::string &json, const std::string &key)
     while (end < json.size() && (json[end] == '-' || (json[end] >= '0' && json[end] <= '9'))) ++end;
     if (end == pos) return 0;
     return std::stoll(json.substr(pos, end - pos));
+}
+
+// Floating-point JSON value of a top-level key; def when the key is absent
+// or the value does not start with a number.
+static double extract_json_double(const std::string &json, const std::string &key, double def) {
+    const std::string v = json_value_after_colon(json, key);
+    if (v.empty()) return def;
+    size_t end = 0;
+    while (end < v.size() && (isdigit(static_cast<unsigned char>(v[end])) || v[end] == '-' ||
+                              v[end] == '+' || v[end] == '.' || v[end] == 'e' || v[end] == 'E')) ++end;
+    if (end == 0) return def;
+    try {
+        return std::stod(v.substr(0, end));
+    } catch (...) {
+        return def;
+    }
 }
 
 static std::string extract_json_section(const std::string &json, const std::string &key) {
@@ -339,6 +374,9 @@ struct Config {
     std::string pool_url;
     std::string pool_user;
     std::string pool_password = "x";
+    // >0: send mining.suggest_difficulty after authorize so pools with a high
+    // default difficulty give share-sized work immediately. 0 = pool default.
+    double pool_suggest_difficulty = 0.0;
 
     // Optional CUDA section.
     int cuda_device = 0;
@@ -365,15 +403,14 @@ struct Config {
         if (const std::string mining = extract_json_section(json, "mining"); !mining.empty()) {
             if (const std::string a = extract_json_string(mining, "address"); !a.empty()) mining_address = a;
             if (const int64_t t = extract_json_int(mining, "threads"); t > 0) threads = static_cast<int>(t);
-            continuous = mining.find("\"continuous\":true") != std::string::npos ||
-                         mining.find("\"continuous\": true") != std::string::npos;
+            continuous = json_value_after_colon(mining, "continuous").compare(0, 4, "true") == 0;
         }
         if (const std::string pool = extract_json_section(json, "pool"); !pool.empty()) {
-            pool_enabled = pool.find("\"enabled\":true") != std::string::npos ||
-                           pool.find("\"enabled\": true") != std::string::npos;
+            pool_enabled = json_value_after_colon(pool, "enabled").compare(0, 4, "true") == 0;
             if (const std::string u = extract_json_string(pool, "url"); !u.empty()) pool_url = u;
             if (const std::string u = extract_json_string(pool, "user"); !u.empty()) pool_user = u;
             if (const std::string p = extract_json_string(pool, "password"); !p.empty()) pool_password = p;
+            pool_suggest_difficulty = extract_json_double(pool, "suggest_difficulty", 0.0);
         }
         if (const std::string cuda = extract_json_section(json, "cuda"); !cuda.empty()) {
             if (const int64_t d = extract_json_int(cuda, "device"); d >= 0) cuda_device = static_cast<int>(d);
@@ -534,8 +571,7 @@ static BlockTemplate parse_template(const std::string &json) {
 
 static std::vector<uint8_t> address_to_scriptpubkey(RpcClient &rpc, const std::string &address) {
     const std::string resp = rpc.call("validateaddress", {json_quote_string(address)});
-    if (resp.find("\"isvalid\":true") == std::string::npos &&
-        resp.find("\"isvalid\": true") == std::string::npos) {
+    if (json_value_after_colon(resp, "isvalid").compare(0, 4, "true") != 0) {
         throw std::runtime_error("Invalid payout address: " + address);
     }
     const std::string spk_hex = extract_json_string(resp, "scriptPubKey");
@@ -917,7 +953,7 @@ __global__ void sha256d_reference_kernel(const uint32_t *__restrict__ headers_be
 // GBT's "target" hex uses).
 static void difficulty_to_target_be(double diff, uint8_t target_msb[32]) {
     std::memset(target_msb, 0, 32);
-    if (!(diff > 0.0) || !std::isfinite(diff)) return; // -> all-zero target (accept everything)
+    if (!(diff > 0.0) || !std::isfinite(diff)) return; // all-zero target: reject everything
 
     // diff = M * 2^exp2 with M a 53-bit integer (frexp + mantissa rounding).
     int exp2 = 0;
@@ -936,7 +972,16 @@ static void difficulty_to_target_be(double diff, uint8_t target_msb[32]) {
     long long top_bit = N;
 
     uint32_t quo[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // 256-bit quotient
-    if (N < 0 || N >= 320 || top_bit >= 308) {
+    // quotient = 2^N / mant lies in (2^(N-53), 2^(N-52)]; it overflows 256
+    // bits only when N >= 309, or exactly at N == 308 when mant == 2^52
+    // (quotient == 2^256). Otherwise the division loop below only sets bits
+    // the quotient actually has, all < 2^256, so it never writes quo[8].
+    // For N < 0 the target would be < 1 -- no digest can qualify -- so clamp
+    // to the all-zero target (reject everything).
+    if (N < 0) {
+        return; // reject everything
+    }
+    if (N > 308 || (N == 308 && mant == (1ULL << 52))) {
         // diff too small to represent -- clamp to maximum target.
         for (int i = 0; i < 32; ++i) target_msb[i] = 0xff;
         return;
@@ -1452,24 +1497,31 @@ static void run_selftest(GpuResult &gpu) {
               << std::dec << " found in window and CPU-verified\n";
 
     // --- 3. difficulty -> target sanity ---
-    uint8_t t1[32], t2[32], t3[32];
+    uint8_t t1[32], t2[32], t3[32], t4[32], t5[32];
     difficulty_to_target_be(1.0, t1);
     difficulty_to_target_be(0.001, t2);
     difficulty_to_target_be(65536.0, t3);
+    difficulty_to_target_be(1e-8, t4);
+    difficulty_to_target_be(1e-10, t5); // target >= 2^256 -> clamped to all-0xff
     auto msb_log2 = [](const uint8_t t[32]) {
         for (int i = 0; i < 32; ++i)
             if (t[i]) return 31 - __builtin_clz(static_cast<uint32_t>(t[i])) + 8 * (31 - i);
         return -1;
     };
     const int l1 = msb_log2(t1), l2 = msb_log2(t2), l3 = msb_log2(t3);
-    // diff 1 -> 2^224 (bit 224), diff 0.001 -> ~2^234, diff 65536 -> ~2^208.
-    if (l1 < 223 || l1 > 224 || l2 < 233 || l2 > 235 || l3 < 207 || l3 > 209) {
+    const int l4 = msb_log2(t4), l5 = msb_log2(t5);
+    // diff 1 -> 2^224 (bit 224), diff 0.001 -> ~2^234, diff 65536 -> ~2^208,
+    // diff 1e-8 -> ~2^250.6, diff 1e-10 -> unrepresentable -> all-0xff (bit 255).
+    if (l1 < 223 || l1 > 224 || l2 < 233 || l2 > 235 || l3 < 207 || l3 > 209 ||
+        l4 < 249 || l4 > 251 || l5 != 255 || t5[0] != 0xff) {
         throw std::runtime_error("Selftest 3 FAILED: unexpected target magnitudes " +
                                  std::to_string(l1) + "/" + std::to_string(l2) + "/" +
-                                 std::to_string(l3));
+                                 std::to_string(l3) + "/" + std::to_string(l4) + "/" +
+                                 std::to_string(l5));
     }
     std::cout << "  3. difficulty->target:      diff1=2^" << l1 << " diff0.001=2^" << l2
-              << " diff65536=2^" << l3 << " (expected 224/234/208)\n";
+              << " diff65536=2^" << l3 << " diff1e-8=2^" << l4 << " diff1e-10=clamp\n"
+              << "                              (expected 224/234/208/251/clamp)\n";
 
     // --- 4. benchmark ---
     uint8_t zero_target[32];
@@ -1488,7 +1540,8 @@ static void run_selftest(GpuResult &gpu) {
     const double hps = static_cast<double>(gpu.consume_hashes()) / secs;
     std::cout << "  4. benchmark:               " << std::fixed << std::setprecision(2)
               << hps / 1e9 << " GH/s over " << secs << " s (" << done / 1000000 << "M nonces)\n";
-    std::cout.unsetf(std::ios::fixed);
+    std::cout.unsetf(std::ios::floatfield); // back to defaultfloat ...
+    std::cout.precision(6);                 // ... and restore precision (sticky!)
 
     // --- 5. CPU midstate path (SHA256_Transform) == plain sha256d ---
     size_t cpu_mismatches = 0;
@@ -1522,7 +1575,8 @@ static void run_selftest(GpuResult &gpu) {
     std::cout << "  6. CPU thread benchmark:    " << std::fixed << std::setprecision(2)
               << static_cast<double>(cpu_done) / 1e6 / cpu_secs
               << " MH/s per thread (midstate path)\n";
-    std::cout.unsetf(std::ios::fixed);
+    std::cout.unsetf(std::ios::floatfield); // back to defaultfloat ...
+    std::cout.precision(6);                 // ... and restore precision (sticky!)
 
     // --- 7. CPU worker: CpuPool finds, re-verifies and reports a nonce ---
     // Reuses the selftest-2 job (prefix / midstate / target_msb) with a
@@ -1872,7 +1926,7 @@ static void pool_network_thread(LineReader &reader, SharedJobState &state, std::
     try {
         for (;;) {
             const std::string line = reader.next_line();
-            if (line.find("\"method\":\"mining.notify\"") != std::string::npos) {
+            if (json_value_after_colon(line, "method").find("mining.notify") != std::string::npos) {
                 StratumJob job = parse_mining_notify(line);
                 const std::string job_id = job.job_id;
                 const bool clean = job.clean_jobs;
@@ -1883,7 +1937,7 @@ static void pool_network_thread(LineReader &reader, SharedJobState &state, std::
                 }
                 state.generation.fetch_add(1);
                 std::cout << "New job " << job_id << " (clean_jobs=" << (clean ? "true" : "false") << ")\n";
-            } else if (line.find("\"method\":\"mining.set_difficulty\"") != std::string::npos) {
+            } else if (json_value_after_colon(line, "method").find("mining.set_difficulty") != std::string::npos) {
                 const double diff = parse_set_difficulty(line);
                 {
                     std::lock_guard<std::mutex> lock(state.mutex);
@@ -1891,9 +1945,9 @@ static void pool_network_thread(LineReader &reader, SharedJobState &state, std::
                 }
                 state.generation.fetch_add(1); // retarget => re-derive target
                 std::cout << "Difficulty set to " << diff << "\n";
-            } else if (line.find("\"result\":true") != std::string::npos) {
+            } else if (json_value_after_colon(line, "result").compare(0, 4, "true") == 0) {
                 std::cout << "Share accepted.\n";
-            } else if (line.find("\"error\":null") == std::string::npos) {
+            } else if (json_value_after_colon(line, "error").compare(0, 4, "null") != 0) {
                 std::cout << "Pool: " << line << "\n";
             }
         }
@@ -1904,7 +1958,11 @@ static void pool_network_thread(LineReader &reader, SharedJobState &state, std::
 }
 
 // The GPU analogue of miner.cpp's CPU pool_mine_thread: watches SharedJobState
-// and keeps the device scanning nonce chunks of the current job.
+// and keeps the device scanning nonce chunks of the current job. The chunk
+// cursor walks the whole 2^32 nonce space one chunk per launch and never
+// repeats within a header (like the solo sweep); on wrap the header's nTime is
+// rolled by one second so the device keeps mining fresh headers instead of
+// re-finding the same nonces of an exhausted job.
 static void pool_gpu_mine_thread(SharedJobState &state,
                                  socket_t sock, std::mutex &send_mutex, const std::string &user,
                                  std::atomic<int> &submit_id, std::atomic<bool> &stop_all,
@@ -1912,6 +1970,10 @@ static void pool_gpu_mine_thread(SharedJobState &state,
     uint64_t last_seen_generation = static_cast<uint64_t>(-1);
     StratumJob local_job;
     double local_diff = 1.0;
+
+    uint32_t span_idx = 0;               // next chunk to scan for the current header
+    uint32_t header_ntime = 0;           // nTime baked into the device header
+    std::vector<uint8_t> header_prefix;  // the header bytes the device is scanning
 
     while (!stop_all.load()) {
         const uint64_t gen = state.generation.load();
@@ -1935,7 +1997,8 @@ static void pool_gpu_mine_thread(SharedJobState &state,
             sha256d(local_job.coinbase.data(), local_job.coinbase.size(), merkle_root);
             apply_merkle_branch(merkle_root, local_job.merkle_branch);
 
-            const std::vector<uint8_t> header_prefix = build_stratum_header_prefix(local_job, merkle_root);
+            header_prefix = build_stratum_header_prefix(local_job, merkle_root);
+            header_ntime = local_job.ntime;
 
             uint8_t target[32];
             difficulty_to_target_be(local_diff, target);
@@ -1943,21 +2006,19 @@ static void pool_gpu_mine_thread(SharedJobState &state,
             uint32_t midstate[8];
             sha256_midstate(header_prefix.data(), midstate);
             gpu.set_job(midstate, header_prefix.data(), target);
+            span_idx = 0; // fresh header -> whole nonce space again
         }
 
-        gpu.scan_chunk(0, GpuResult::NONCE_SPAN);
+        gpu.scan_chunk(span_idx << 24, GpuResult::NONCE_SPAN);
         hash_total.fetch_add(gpu.consume_hashes());
 
         if (gpu.host_ctrl[0] == 1) {
             const uint32_t nonce = gpu.host_ctrl[1];
             uint8_t header80[80];
-            {
-                uint8_t merkle_root[32];
-                sha256d(local_job.coinbase.data(), local_job.coinbase.size(), merkle_root);
-                apply_merkle_branch(merkle_root, local_job.merkle_branch);
-                const std::vector<uint8_t> prefix = build_stratum_header_prefix(local_job, merkle_root);
-                std::memcpy(header80, prefix.data(), 76);
-            }
+            // The find belongs to the header that was scanned: reuse the saved
+            // prefix (with its nTime) instead of rebuilding from local_job,
+            // which may already carry a newer job.
+            std::memcpy(header80, header_prefix.data(), 76);
             header80[76] = nonce & 0xff;
             header80[77] = (nonce >> 8) & 0xff;
             header80[78] = (nonce >> 16) & 0xff;
@@ -1968,9 +2029,27 @@ static void pool_gpu_mine_thread(SharedJobState &state,
             if (hash_to_difficulty(hash) >= local_diff) {
                 std::cout << "Share found! job=" << local_job.job_id << " nonce=" << std::hex
                           << nonce << std::dec << " diff=" << hash_to_difficulty(hash) << "\n";
-                submit_share(sock, send_mutex, submit_id, user, local_job.job_id, local_job.ntime, nonce);
+                submit_share(sock, send_mutex, submit_id, user, local_job.job_id,
+                             header_ntime, nonce);
             }
-            // else: stale/aborted chunk raced a job change -- discard.
+            // else: the find raced a job change -- its header is no longer current.
+        }
+
+        // Advance the cursor; no chunk is scanned twice within one header.
+        if (++span_idx >= 256) {
+            // Nonce space exhausted for the current header: roll nTime by one
+            // second (pool doc allows small rolling windows; the submit carries
+            // the rolled ntime) and restart the sweep. The midstate covers
+            // header bytes 0..63, so patching the nTime word is the only
+            // state change needed for a fresh header.
+            span_idx = 0;
+            ++header_ntime;
+            header_prefix[68] = static_cast<uint8_t>(header_ntime & 0xff);
+            header_prefix[69] = static_cast<uint8_t>((header_ntime >> 8) & 0xff);
+            header_prefix[70] = static_cast<uint8_t>((header_ntime >> 16) & 0xff);
+            header_prefix[71] = static_cast<uint8_t>((header_ntime >> 24) & 0xff);
+            gpu.set_ntime(header_ntime);
+            std::cout << "Nonce space exhausted -- rolled nTime (+1 s)" << std::endl;
         }
     }
 }
@@ -2007,13 +2086,27 @@ static int run_pool_mode(const Config &cfg, GpuResult &gpu, std::atomic<uint64_t
             }
             const std::string authorize_response = reader.next_line();
             std::cout << "Authorize response: " << authorize_response << "\n";
-            if (authorize_response.find("\"result\":true") == std::string::npos) {
+            if (json_value_after_colon(authorize_response, "result").compare(0, 4, "true") != 0) {
                 std::cerr << "ERROR: Authorization rejected. pool.user must be "
                              "\"<your Elektron address>.<worker name>\" -- check the address is valid.\n";
                 close_socket(sock);
                 if (!cfg.continuous) return 1;
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 continue;
+            }
+            // Ask for share-sized work right away. Pools start new sessions at
+            // a fixed default (often network difficulty -- no share for days
+            // at our hashrate); suggest_difficulty skips that ramp. Pools that
+            // don't implement the message simply ignore it.
+            if (cfg.pool_suggest_difficulty > 0) {
+                std::ostringstream sugg;
+                sugg << "{\"id\":3,\"method\":\"mining.suggest_difficulty\",\"params\":["
+                     << cfg.pool_suggest_difficulty << "]}";
+                {
+                    std::lock_guard<std::mutex> lock(send_mutex);
+                    socket_send_line(sock, sugg.str());
+                }
+                std::cout << "Suggested difficulty " << cfg.pool_suggest_difficulty << "\n";
             }
             std::cout << "Authorized. Waiting for work...\n";
 
@@ -2168,8 +2261,7 @@ int main(int argc, char *argv[]) {
         std::cout << "Submitting block from " << source << " (nonce=" << nonce << ")\n";
         const std::string block_hex = assemble_block_hex(tmpl, header80, coinbase_tx);
         const std::string submit_resp = rpc.call("submitblock", {json_quote_string(block_hex)});
-        if (submit_resp.find("\"result\":null") != std::string::npos ||
-            submit_resp.find("\"result\": null") != std::string::npos) {
+        if (json_value_after_colon(submit_resp, "result").compare(0, 4, "null") == 0) {
             std::cout << "Block accepted.\n";
             return true;
         }
@@ -2188,9 +2280,8 @@ int main(int argc, char *argv[]) {
                 "{\"rules\":[\"segwit\"],\"coinbaseaddress\":\"" + cfg.mining_address + "\"}";
             const std::string tmpl_json = rpc.call("getblocktemplate", {gbt_params});
 
-            if (tmpl_json.find("\"error\":") != std::string::npos &&
-                tmpl_json.find("\"error\":null") == std::string::npos &&
-                tmpl_json.find("\"error\": null") == std::string::npos) {
+            const std::string gbt_error = json_value_after_colon(tmpl_json, "error");
+            if (!gbt_error.empty() && gbt_error.compare(0, 4, "null") != 0) {
                 std::cerr << "RPC error: " << tmpl_json << "\n";
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 continue;
@@ -2327,7 +2418,8 @@ int main(int argc, char *argv[]) {
                           << (gpu_ghps + cpu_ghps) << " GH/s (GPU " << gpu_ghps << " + CPU "
                           << cpu_ghps << ")  height " << height_current
                           << "  ntime +" << (ntime_current - base_curtime) << "s\n";
-                std::cout.unsetf(std::ios::fixed);
+                std::cout.unsetf(std::ios::floatfield); // back to defaultfloat ...
+                std::cout.precision(6);                 // ... and restore precision (sticky!)
             }
         } catch (const std::exception &e) {
             std::cerr << "Error: " << e.what() << "\n";
