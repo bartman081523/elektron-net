@@ -386,6 +386,17 @@ The env var `ELEK_CUDA_TPB` (64–1024, multiple of 32) overrides the kernel's
 threads-per-block for benchmarking; the default 256 measured fastest on
 Turing.
 
+`ELEK_CUDA_ILP` (1, 2 or 4) selects how many consecutive nonces each thread
+hashes in interleaved SHA-256 chains (multi-candidate ILP, the hashcat /
+cpuminer-multi trick). Measured on an RTX 2060 (sm_75) it always loses:
+with 64k registers per SM every variant keeps exactly 1024 concurrent
+chains resident, so ILP only trades warp-scheduler latency hiding for
+register pressure — best cells were 1.41 GH/s (ILP=2) and 1.30 GH/s
+(ILP=4) vs 1.72 GH/s (ILP=1). The default stays 1; the knob exists for
+GPUs with a different register/SM balance. ILP×block-size combinations
+that exceed the SM register file are rejected at startup and fall back to
+ILP=1 instead of failing the first launch.
+
 ### Usage
 
 ```bash

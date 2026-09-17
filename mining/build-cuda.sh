@@ -30,6 +30,7 @@ fi
     -ccbin "$HOSTCC" \
     -O3 -std=c++20 \
     -arch=sm_$ARCH \
+    -Xptxas -v \
     -I "$ENV_DIR/include" \
     -L "$ENV_DIR/lib" \
     -Xlinker -rpath -Xlinker "$ENV_DIR/lib" \
