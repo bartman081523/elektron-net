@@ -65,6 +65,14 @@ Elektron Net. Read §3 carefully.
 `getblocktemplate` returns the standard Bitcoin fields plus the Elektron
 extensions. Call it with at least `{"rules": ["segwit"], "coinbaseaddress": "<be1q…>"}`.
 
+> **Mandatory.** Omitting `coinbaseaddress` makes the node build its
+> blank-coinbase template with a bare `OP_TRUE` payout (the default in
+> `src/node/types.h`). The UTXO attestation hash is computed over exactly
+> that payout, so a pool that assembles its own coinbase with any other
+> first output produces a merkle root the node will reject -- and every
+> block it builds is invalid. Pass your payout address so the template the
+> node attests and the coinbase the pool builds agree on the first output.
+
 ```json
 {
   "version": 536870912,
@@ -346,6 +354,17 @@ exposes:
 Sessions whose `userAgent` does not match the list still benefit from
 the §3.5 wiring (modern ASICs accept non-empty `extranonce1` too); the
 allow-list only affects the starting difficulty.
+
+Non-allow-listed sessions start at the pool's normal default difficulty
+(the deployed PPLNS instance uses 100000, roughly network difficulty --
+an RTX-2060-class miner would go days without a share at that level).
+Clients can skip the ramp by sending `mining.suggest_difficulty` right
+after `mining.authorize`; the reference pool honors it and immediately
+re-emits a matching `mining.set_difficulty` (verified live 2026-09-17).
+var-diff keeps tuning afterwards: the pool checks every 60 s and divides
+the difficulty by 8 while a session's share rate stays below its target,
+so a client that never suggests a difficulty ramps down over a few
+minutes of shareless mining.
 
 Stratum v2 (BIP not yet ratified) makes header-only mining a
 first-class mode and avoids any of this. Once firmwares ship Stratum v2
