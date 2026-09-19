@@ -51,6 +51,12 @@ config.json; the positional argument is the config path.
 ```sh
 ./elektron_miner_cuda --pool --pool-url stratum+tcp://pool:3333 \
     --pool-user <address>.<worker> --pool-password x --suggest-difficulty 8
+
+# Solo against the local node: the elektron defaults (rpc.user=elek,
+# rpc.password=pass, url http://127.0.0.1:8332) come from config.json, the
+# payout address from the CPU miner instructions via --address:
+./elektron_miner_cuda config.json \
+    --address be1qccy42avfqnw2wxf8c790w3nqtj0vwtmmc0uz6y
 ```
 
 ---
@@ -362,16 +368,19 @@ The GPU architecture can be overridden with `ELEK_CUDA_ARCH` (e.g.
 `ELEK_CUDA_ARCH=86` for Ampere). The script links the conda env's libcurl/
 OpenSSL and embeds an rpath, so the binary runs without LD_LIBRARY_PATH tweaks.
 
-**Option B — CMake (uses the system CUDA toolkit):**
+**Option B — CMake (system CUDA toolkit, or the micromamba env via `CUDACXX`):**
 
 ```bash
 export CUDACXX=$HOME/micromamba/envs/elektron-cuda/bin/nvcc   # or system nvcc
-cmake -B build -DELEKTRON_BUILD_CUDA_MINER=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake -B build -DELEKTRON_BUILD_CUDA_MINER=ON -DCMAKE_CUDA_ARCHITECTURES=75 \
+    -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-`ELEKTRON_BUILD_CUDA_MINER` is OFF by default; without a usable CUDA compiler
-CMake fails with a pointer to CUDACXX / `build-cuda.sh`.
+`ELEKTRON_BUILD_CUDA_MINER` is OFF by default. With a micromamba-env nvcc the
+host compiler (the env's conda gcc) and the env's libcurl/OpenSSL are picked
+up automatically; without a usable CUDA compiler CMake fails with a pointer
+to CUDACXX / `build-cuda.sh`.
 
 ### Selftest
 
@@ -407,7 +416,7 @@ device (34 SMs × 1024 threads/SM on an RTX 2060). Optional extras:
     "password": "pass"
   },
   "mining": {
-    "address": "be1qz6g54krxvqtyuzkh340qdm57wukckzejayvp63",
+    "address": "be1qccy42avfqnw2wxf8c790w3nqtj0vwtmmc0uz6y",
     "threads": 4,
     "continuous": true
   },
@@ -443,8 +452,26 @@ ILP=1 instead of failing the first launch.
 # Solo mining against the local node (default) -- GPU + CPU workers
 ./elektron_miner_cuda config.json
 
+# The payout address from the CPU miner instructions overrides mining.address:
+./elektron_miner_cuda config.json \
+    --address be1qccy42avfqnw2wxf8c790w3nqtj0vwtmmc0uz6y
+
 # Pool mining via stratum
 ./elektron_miner_cuda config.json   # with pool.enabled = true
+```
+
+Example output of the solo run (verified live):
+
+```
+Mode:    Solo (RPC)
+RPC:     http://127.0.0.1:8332
+Address: be1qccy42avfqnw2wxf8c790w3nqtj0vwtmmc0uz6y
+CPU workers: 4 thread(s) on chunks 252..255; GPU covers chunks 0..251
+
+Fetching block template...
+Required coinbase outputs: 2
+Height: 229641  bits: 1b009432
+Rate: 1.76 GH/s (GPU 1.71 + CPU 0.04)  height 229641  ntime +0s
 ```
 
 CPU workers are active in **solo mode only** — in pool mode the GPU scans
