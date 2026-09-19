@@ -13,7 +13,45 @@ This directory contains standalone CPU and GPU mining tools for Elektron Net, fu
 | `config.json` | Configuration file for all miners (RPC, payout address, threads). |
 | `CMakeLists.txt` | Build file for the C++ miner (plus optional CUDA target). |
 | `miner_cuda.cu` | Standalone CUDA miner (SHA-256d kernel, midstate + nTime rolling, joint CPU + GPU mining, solo + pool mode). |
-| `build-cuda.sh` | Direct nvcc build script for `elektron_miner_cuda` (micromamba/conda toolchain). |
+| `build-cuda.sh` | Direct nvcc build script for `elektron_miner_cuda` (system CUDA toolkit, or auto-bootstrapped micromamba env). |
+| `build-cuda.bat` | Windows equivalent of `build-cuda.sh` (micromamba + MSVC host compiler via vswhere). |
+
+---
+
+## CUDA Miner (elektron_miner_cuda)
+
+### Linux: `build-cuda.sh`
+Uses the system nvcc when a CUDA toolkit is installed (needs libcurl +
+OpenSSL dev packages). Otherwise it bootstraps micromamba into
+`~/micromamba` and creates the `elektron-cuda` environment automatically
+(nvcc 12.9 + conda-forge gcc 13 as host compiler + libcurl + openssl).
+
+```sh
+./build-cuda.sh [output_dir]                 # ELEK_CUDA_ARCH=86 for other GPUs
+ELEK_CUDA_FORCE_MICROMAMBA=1 ./build-cuda.sh # ignore a system nvcc
+```
+
+### Windows: `build-cuda.bat`
+Same strategy. Requires Visual Studio 2019+ (or Build Tools) with the
+"Desktop development with C++" workload, because nvcc needs `cl.exe` as its
+host compiler. Micromamba is bootstrapped into `%USERPROFILE%\micromamba`
+when no system CUDA toolkit is present.
+
+```bat
+build-cuda.bat [output_dir]
+```
+
+### CLI options (every config.json field is also on the command line)
+Same options as the reference CPU miner `miner.py`: `--url --user --password
+--address --threads --continuous`, plus `--pool / --no-pool --pool-url
+--pool-user --pool-password --suggest-difficulty --device --cpu-threads
+--selftest --print-config --help`. Options override
+config.json; the positional argument is the config path.
+
+```sh
+./elektron_miner_cuda --pool --pool-url stratum+tcp://pool:3333 \
+    --pool-user <address>.<worker> --pool-password x --suggest-difficulty 8
+```
 
 ---
 
@@ -350,8 +388,10 @@ refuses to mine if it fails:
 
 ```bash
 ./elektron_miner_cuda config.json --selftest     # selftest only, exit afterwards
-./elektron_miner_cuda config.json --noselftest   # skip selftest, start mining directly
 ```
+
+The selftest always runs on startup (items 1-7); mining only starts when it
+passes.
 
 ### Config
 
