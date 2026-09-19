@@ -52,7 +52,7 @@
  *   ./elektron_miner_cuda config.json            # solo or pool, from config
  *   ./elektron_miner_cuda --selftest [config]    # kernel correctness + bench
  *
- * Selftest (also runs on every startup unless --noselftest is given):
+ * The selftest always runs on startup; mining only starts when it passes.
  *   1. GPU sha256d digests are compared against OpenSSL for 4096 random
  *      80-byte headers.
  *   2. A known-nonce scan: the target is set to the digest of a chosen
@@ -85,6 +85,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2142,25 +2143,166 @@ static int run_pool_mode(const Config &cfg, GpuResult &gpu, std::atomic<uint64_t
 // Main
 // ---------------------------------------------------------------------------
 
+// Same options as the reference CPU miner (miner.py): --url --user --password
+// --address --threads --continuous. Every remaining config.json field is also
+// on the command line; options override the config file.
+static void print_usage(const char *argv0) {
+    std::cout <<
+        "Usage: " << argv0 << " [options] [config.json]\n"
+        "\n"
+        "Solo (RPC) mining -- same options as the reference CPU miner:\n"
+        "  --url URL                 RPC URL of the node (rpc.url)\n"
+        "  --user USER               RPC username (rpc.user)\n"
+        "  --password PASS           RPC password (rpc.password)\n"
+        "  --address ADDRESS         payout address (mining.address)\n"
+        "  --threads N               mining threads (mining.threads)\n"
+        "  --continuous              mine continuously (mining.continuous)\n"
+        "  --no-continuous           stop after the first block\n"
+        "\n"
+        "Pool (Stratum V1):\n"
+        "  --pool / --no-pool        enable / disable pool mode (pool.enabled)\n"
+        "  --pool-url URL            e.g. stratum+tcp://host:3333 (pool.url)\n"
+        "  --pool-user USER          <address>.<worker> (pool.user)\n"
+        "  --pool-password PASS      usually \"x\" (pool.password)\n"
+        "  --suggest-difficulty D    difficulty to request after authorize\n"
+        "                            (pool.suggest_difficulty)\n"
+        "\n"
+        "GPU / CPU:\n"
+        "  --device N                CUDA device index (cuda.device)\n"
+        "  --cpu-threads N           CPU workers in solo mode; 0 disables\n"
+        "                            (cpu.threads)\n"
+        "\n"
+        "Misc:\n"
+        "  --selftest                run the selftest and exit\n"
+        "  --print-config            print the effective config and exit\n"
+        "  --help                    show this help\n"
+        "\n"
+        "Options win over config.json. The positional argument is the config\n"
+        "path (default ./config.json; a missing file means defaults). The\n"
+        "startup selftest always runs -- mining starts only when it passes.\n";
+}
+
 int main(int argc, char *argv[]) {
 #if defined(_WIN32)
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
 
-    // Arg handling: [--selftest|--noselftest] [config.json]
-    bool do_selftest = true;
-    std::string config_path = "config.json";
+    // Arg handling: same options as the reference CPU miner (miner.py:
+    // --url --user --password --address --threads --continuous), extended by
+    // the pool/GPU fields. Options override the config file; the positional
+    // argument is the config.json path (default ./config.json).
     bool selftest_only = false;
+    bool want_help = false;
+    bool print_config = false;
+    std::string config_path = "config.json";
+    std::vector<std::string> arg_errors;
+
+    // Parsed overrides, applied after the config file load.
+    struct {
+        std::optional<std::string> url, user, password, address;
+        std::optional<int> threads, cpu_threads, device;
+        std::optional<double> suggest_difficulty;
+        std::optional<bool> continuous, pool_enabled;
+        std::optional<std::string> pool_url, pool_user, pool_password;
+    } ov;
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--selftest") { do_selftest = true; selftest_only = true; }
-        else if (arg == "--noselftest") do_selftest = false;
-        else config_path = arg;
+        std::string flag = arg, eq_val;
+        bool has_eq = false;
+        if (const size_t eq = arg.find('='); eq != std::string::npos) {
+            flag = arg.substr(0, eq);
+            eq_val = arg.substr(eq + 1);
+            has_eq = true;
+        }
+        auto value = [&](const char *name) -> std::optional<std::string> {
+            if (has_eq) return eq_val;
+            if (i + 1 < argc) return std::string(argv[++i]);
+            arg_errors.push_back("missing value for " + std::string(name));
+            return std::nullopt;
+        };
+        auto number = [&](const char *name) -> std::optional<double> {
+            const std::optional<std::string> v = value(name);
+            if (!v) return std::nullopt;
+            try {
+                size_t pos = 0;
+                const double d = std::stod(*v, &pos);
+                if (pos != v->size()) throw std::invalid_argument("trailing characters");
+                return d;
+            } catch (...) {
+                arg_errors.push_back("not a number for " + std::string(name) + ": '" + *v + "'");
+                return std::nullopt;
+            }
+        };
+
+        if (flag == "--selftest") selftest_only = true;
+        else if (flag == "--help" || flag == "-h") want_help = true;
+        else if (flag == "--print-config") print_config = true;
+        else if (flag == "--url") ov.url = value(flag.c_str());
+        else if (flag == "--user") ov.user = value(flag.c_str());
+        else if (flag == "--password") ov.password = value(flag.c_str());
+        else if (flag == "--address") ov.address = value(flag.c_str());
+        else if (flag == "--threads") { if (const auto n = number(flag.c_str())) ov.threads = static_cast<int>(*n); }
+        else if (flag == "--cpu-threads") { if (const auto n = number(flag.c_str())) ov.cpu_threads = static_cast<int>(*n); }
+        else if (flag == "--device") { if (const auto n = number(flag.c_str())) ov.device = static_cast<int>(*n); }
+        else if (flag == "--suggest-difficulty") { if (const auto n = number(flag.c_str())) ov.suggest_difficulty = *n; }
+        else if (flag == "--continuous") ov.continuous = true;
+        else if (flag == "--no-continuous") ov.continuous = false;
+        else if (flag == "--pool") ov.pool_enabled = true;
+        else if (flag == "--no-pool") ov.pool_enabled = false;
+        else if (flag == "--pool-url") ov.pool_url = value(flag.c_str());
+        else if (flag == "--pool-user") ov.pool_user = value(flag.c_str());
+        else if (flag == "--pool-password") ov.pool_password = value(flag.c_str());
+        else if (!has_eq && !arg.starts_with("--")) config_path = arg;
+        else arg_errors.push_back("unknown option: " + flag);
+    }
+
+    if (want_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (!arg_errors.empty()) {
+        for (const std::string &e : arg_errors) std::cerr << "ERROR: " << e << "\n";
+        std::cerr << "Run with --help for the option list.\n";
+        return 2;
     }
 
     Config cfg;
     cfg.load(config_path);
+
+    // Command-line options override config.json.
+    if (ov.url) cfg.rpc_url = *ov.url;
+    if (ov.user) cfg.rpc_user = *ov.user;
+    if (ov.password) cfg.rpc_password = *ov.password;
+    if (ov.address) cfg.mining_address = *ov.address;
+    if (ov.threads) cfg.threads = *ov.threads;
+    if (ov.cpu_threads) cfg.cpu_threads = *ov.cpu_threads;
+    if (ov.device) cfg.cuda_device = *ov.device;
+    if (ov.suggest_difficulty) cfg.pool_suggest_difficulty = *ov.suggest_difficulty;
+    if (ov.continuous) cfg.continuous = *ov.continuous;
+    if (ov.pool_enabled) cfg.pool_enabled = *ov.pool_enabled;
+    if (ov.pool_url) cfg.pool_url = *ov.pool_url;
+    if (ov.pool_user) cfg.pool_user = *ov.pool_user;
+    if (ov.pool_password) cfg.pool_password = *ov.pool_password;
+
+    if (print_config) {
+        std::cout << "rpc.url                 = " << cfg.rpc_url << "\n"
+                  << "rpc.user                = " << cfg.rpc_user << "\n"
+                  << "rpc.password            = " << (cfg.rpc_password.empty() ? "(empty)" : "(set)") << "\n"
+                  << "mining.address          = " << cfg.mining_address << "\n"
+                  << "mining.threads          = " << cfg.threads << "\n"
+                  << "mining.continuous       = " << (cfg.continuous ? "true" : "false") << "\n"
+                  << "cpu.threads             = " << cfg.cpu_threads << "\n"
+                  << "cuda.device             = " << cfg.cuda_device << "\n"
+                  << "pool.enabled            = " << (cfg.pool_enabled ? "true" : "false") << "\n"
+                  << "pool.url                = " << cfg.pool_url << "\n"
+                  << "pool.user               = " << cfg.pool_user << "\n"
+                  << "pool.password           = " << (cfg.pool_password.empty() ? "(empty)" : "(set)") << "\n"
+                  << "pool.suggest_difficulty = " << cfg.pool_suggest_difficulty << "\n"
+                  << "config file             = " << config_path << "\n";
+        return 0;
+    }
 
     std::cout << "Elektron Net GPU Miner (CUDA)\n";
 
@@ -2176,15 +2318,21 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "Device:  " << gpu.name() << "\n";
 
-    if (do_selftest) {
-        try {
-            run_selftest(gpu);
-        } catch (const std::exception &e) {
-            std::cerr << "\n" << e.what() << "\n";
-            std::cerr << "Refusing to mine -- fix the selftest failure first.\n";
-            return 1;
-        }
-        if (selftest_only) return 0;
+    // Selftest is mandatory: refuse to mine on any failure. --selftest stops
+    // after the selftest.
+    try {
+        run_selftest(gpu);
+    } catch (const std::exception &e) {
+        std::cerr << "\n" << e.what() << "\n";
+        std::cerr << "Refusing to mine -- fix the selftest failure first.\n";
+        return 1;
+    }
+    if (selftest_only) return 0;
+
+    if (cfg.pool_enabled && (cfg.pool_url.empty() || cfg.pool_user.empty())) {
+        std::cerr << "ERROR: pool.url and pool.user must both be set (config.json "
+                     "or CLI) when pool mode is enabled.\n";
+        return 1;
     }
 
     if (cfg.pool_enabled) {
@@ -2195,7 +2343,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (cfg.mining_address.empty()) {
-        std::cerr << "ERROR: No payout address. Set mining.address in config.json.\n";
+        std::cerr << "ERROR: No payout address. Use --address or set mining.address in config.json.\n";
         return 1;
     }
 
