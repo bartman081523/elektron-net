@@ -52,3 +52,5 @@ trust implications are tracked separately in
 The choice depends on how far the project wants to push snapshot
 verification without a maintainer-facing change to the attestation
 design — see the design issue tracking this ADR.
+
+**Upstream design issue:** [kutlusoy/elektron-net#58](https://github.com/kutlusoy/elektron-net/issues/58)

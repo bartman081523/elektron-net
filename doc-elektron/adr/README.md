@@ -50,3 +50,5 @@ flowchart TD
 ```
 
 The three accepted ADRs 0001–0003 describe these subsystems in detail.
+The six proposed records are tracked upstream as design issues
+[#57](https://github.com/kutlusoy/elektron-net/issues/57)–[#62](https://github.com/kutlusoy/elektron-net/issues/62).

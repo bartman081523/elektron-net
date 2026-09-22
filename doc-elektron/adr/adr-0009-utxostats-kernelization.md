@@ -42,3 +42,5 @@ include cycle itself is gone.
   the natural vehicle for follow-up discussion.
 
 See the design issue tracking this ADR.
+
+**Upstream design issue:** [kutlusoy/elektron-net#62](https://github.com/kutlusoy/elektron-net/issues/62)

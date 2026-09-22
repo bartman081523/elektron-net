@@ -57,3 +57,5 @@ This is an inherited-upstream latent issue, not fork-specific logic —
 but the fork's mandatory pruning and snapshot bootstrap widen the
 rescan/reorg paths wallets can encounter, so the invariant is worth
 verifying here. See the design issue tracking this ADR.
+
+**Upstream design issue:** [kutlusoy/elektron-net#60](https://github.com/kutlusoy/elektron-net/issues/60)

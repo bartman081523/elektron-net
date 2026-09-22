@@ -47,3 +47,5 @@ Option 1 is a small, reviewable cleanup consistent with the accepted
 pruning model; options 2 and 3 are listed for completeness. The choice
 between them belongs to the maintainer — see the design issue tracking
 this ADR.
+
+**Upstream design issue:** [kutlusoy/elektron-net#57](https://github.com/kutlusoy/elektron-net/issues/57)

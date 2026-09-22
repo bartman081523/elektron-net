@@ -57,3 +57,5 @@ in `mining/miner.py`).
   `mining/` is built and versioned independently of the node.
 
 See the design issue tracking this ADR for the maintainer question.
+
+**Upstream design issue:** [kutlusoy/elektron-net#61](https://github.com/kutlusoy/elektron-net/issues/61)

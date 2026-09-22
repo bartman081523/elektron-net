@@ -62,3 +62,5 @@ blocked by the attestation's computation order:
   first-responder selection logic; they should be decided together with
   [ADR-0005](adr-0005-snapshot-source-selection.md). See the design
   issue tracking this ADR for the maintainer question.
+
+**Upstream design issue:** [kutlusoy/elektron-net#59](https://github.com/kutlusoy/elektron-net/issues/59)
