@@ -1,0 +1,93 @@
+# Linux release assets for the fork: the app integration tests need a runnable
+# elektrond, and the upstream release only ships Windows builds.
+name: release-linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the asset to (created when missing)"
+        required: true
+        default: "node-linux-ci"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config python3 \
+            libboost-all-dev libevent-dev libsqlite3-dev libzmq3-dev
+
+      - name: Extract version
+        id: version
+        run: |
+          MAJOR=$(grep -m1 'set(CLIENT_VERSION_MAJOR' CMakeLists.txt | grep -o '[0-9]*')
+          MINOR=$(grep -m1 'set(CLIENT_VERSION_MINOR' CMakeLists.txt | grep -o '[0-9]*')
+          BUILD=$(grep -m1 'set(CLIENT_VERSION_BUILD' CMakeLists.txt | grep -o '[0-9]*')
+          RC=$(grep -m1 'set(CLIENT_VERSION_RC' CMakeLists.txt | grep -o '[0-9]*')
+          IS_RELEASE=$(grep -m1 'set(CLIENT_VERSION_IS_RELEASE' CMakeLists.txt | grep -o 'true\|false')
+          if [ "$IS_RELEASE" = "false" ] && [ "$RC" != "0" ]; then
+            VERSION="v${MAJOR}.${MINOR}.${BUILD}-rc${RC}"
+          else
+            VERSION="v${MAJOR}.${MINOR}.${BUILD}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Elektron Net ${VERSION}"
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DENABLE_WALLET=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/staging"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)" --target elektrond elektron-cli
+
+      - name: Package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          NAME="elektron-net-linux-${VERSION}-x86_64"
+          mkdir -p "dist/$NAME"
+          for bin in elektrond elektron-cli; do
+            found=$(find build -type f -name "$bin" -perm -u+x | head -1)
+            echo "$bin -> $found"
+            cp "$found" "dist/$NAME/"
+          done
+          ./dist/$NAME/elektrond --version || true
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: elektron-net-linux-${{ steps.version.outputs.version }}
+          path: dist/elektron-net-linux-*-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          prerelease: true
+          files: dist/elektron-net-linux-*-x86_64.tar.gz
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
